@@ -32,6 +32,10 @@ PeFile::ParseStatusCode PeFile::ParseFile() noexcept {
   for (int i = 0; i < IMAGE_NUMBEROF_DIRECTORY_ENTRIES; i++) {
     IMAGE_DATA_DIRECTORY data_directory = nt_headers_->OptionalHeader.DataDirectory[i];
 
+    if (data_directory.Size == 0) {
+      continue;
+    }
+    
     switch (i) {
       case IMAGE_DIRECTORY_ENTRY_EXPORT: { this->ParseExportTable(&data_directory); break; }
       case IMAGE_DIRECTORY_ENTRY_IMPORT: { this->ParseImportTable(&data_directory); break; }
