@@ -35,7 +35,7 @@ PeFile::ParseStatusCode PeFile::ParseFile() noexcept {
     if (data_directory.Size == 0) {
       continue;
     }
-    
+
     switch (i) {
       case IMAGE_DIRECTORY_ENTRY_EXPORT: { this->ParseExportTable(&data_directory); break; }
       case IMAGE_DIRECTORY_ENTRY_IMPORT: { this->ParseImportTable(&data_directory); break; }
@@ -60,49 +60,61 @@ PeFile::~PeFile() {
 }
 
 void PeFile::ParseImportTable(PIMAGE_DATA_DIRECTORY data_directory) noexcept {
-  auto imports = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(
-      image_start_ + this->GetFileOffsetFromRVA(data_directory->VirtualAddress)
+  const auto iat_rva = nt_headers_->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress;
+
+  // Get the Import Descriptors
+  auto imports = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(
+    image_start_ + GetFileOffsetFromRVA(data_directory->VirtualAddress)
   );
 
+  // Iterate through the Import Descriptors
   while (imports->Name != 0) {
-    auto dll_name = reinterpret_cast<char *>(image_start_ + this->GetFileOffsetFromRVA(imports->Name));
-    auto thunk = static_cast<int64_t>(image_start_ + this->GetFileOffsetFromRVA(imports->OriginalFirstThunk));
-    // @TODO: Add IAT parsing and saving RVA for PE loading libraries
+    // Get the DLL name
+    const auto *dll_name = reinterpret_cast<const char*>(
+      image_start_ + GetFileOffsetFromRVA(imports->Name)
+    );
 
-    std::string dll = std::string(dll_name);
+    // Get the Original First Thunk (import names) and First Thunk (IAT)
+    const auto *thunk = reinterpret_cast<const IMAGE_THUNK_DATA*>(
+      image_start_ + GetFileOffsetFromRVA(imports->OriginalFirstThunk)
+    );
+    const auto *iat_thunk = reinterpret_cast<const IMAGE_THUNK_DATA*>(
+      image_start_ + GetFileOffsetFromRVA(imports->FirstThunk)
+    );
 
-    while (true) {
-      auto rva = *reinterpret_cast<int64_t *>(thunk);
-
-      if (rva == 0) {
-        break;
-      }
-
-      if (rva > 0) {
-        // import by name
-
-        std::string function_name = std::string(reinterpret_cast<char *>(image_start_ + this->GetFileOffsetFromRVA(rva) + 2));
-
-        imports_.push_back(PeImport {
-            dll,
-            function_name,
-            static_cast<uint64_t>(rva)
+    // Iterate through the functions in the DLL
+    const auto first_thunk_address = reinterpret_cast<uint64_t>(thunk);
+    while (thunk->u1.AddressOfData != 0) {
+      const auto current_idx = reinterpret_cast<uint64_t>(thunk) - first_thunk_address;
+      if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG) {
+        // Import by ordinal
+        imports_.push_back(PeImport{
+          .dll_name = dll_name,
+          .function_name = "Ordinal_" + std::to_string(IMAGE_ORDINAL(thunk->u1.Ordinal)),
+          .RVA = thunk->u1.Ordinal,
+          .IAT_RVA = (iat_rva + current_idx)
         });
       } else {
-        // import by ordinal
+        // Import by name
+        const auto *import_by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
+          image_start_ + GetFileOffsetFromRVA(thunk->u1.AddressOfData)
+        );
 
-        std::string function_name = std::to_string(rva);
-
-        imports_.push_back(PeImport {
-            dll,
-            function_name,
-            static_cast<uint64_t>(rva)
+        imports_.push_back(PeImport{
+          .dll_name = dll_name,
+          .function_name = import_by_name->Name,
+          .RVA = thunk->u1.AddressOfData,
+          .IAT_RVA = (iat_rva + current_idx)
         });
       }
 
-      thunk += 8;
+      // Move to the next function
+      ++thunk;
+      ++iat_thunk;
     }
-    imports++;
+
+    // Move to the next DLL
+    ++imports;
   }
 }
 
@@ -155,21 +167,24 @@ std::vector<PeImport> PeFile::GetImports() const noexcept {
   return imports_;
 }
 
-uint64_t PeFile::GetFileOffsetFromRVA(uint64_t RVA) const noexcept {
-  uint64_t file_offset = RVA;
+uint64_t PeFile::GetFileOffsetFromRVA(uint64_t rva) const noexcept {
+  // Iterate through the section headers to find the section that contains the RVA
+  auto section_header = reinterpret_cast<PIMAGE_SECTION_HEADER>(
+      image_start_ + dos_header_->e_lfanew + sizeof(IMAGE_NT_HEADERS)
+  );
 
-  for (int i = 0; i < nt_headers_->FileHeader.NumberOfSections; i++) {
-    auto section_header = reinterpret_cast<PIMAGE_SECTION_HEADER>(image_start_ + dos_header_->e_lfanew + sizeof(_IMAGE_NT_HEADERS64) + i * sizeof(IMAGE_SECTION_HEADER));
-
-    if (RVA > section_header->VirtualAddress && RVA < (section_header->VirtualAddress + section_header->Misc.VirtualSize)) {
-      file_offset -= section_header->VirtualAddress;
-      file_offset += section_header->PointerToRawData;
-
-      break;
-    }
+  for (int i = 0; i < nt_headers_->FileHeader.NumberOfSections; ++i) {
+    // Check if the RVA falls within this section's virtual address range
+    if (rva >= section_header[i].VirtualAddress &&
+        rva < section_header[i].VirtualAddress + section_header[i].SizeOfRawData) {
+      // Calculate the file offset by adding the section's pointer to raw data
+      // and the difference between the RVA and the section's virtual address
+      return section_header[i].PointerToRawData + (rva - section_header[i].VirtualAddress);
+        }
   }
 
-  return file_offset;
+  // If the RVA is not found in any section, return 0 (invalid)
+  return 0;
 }
 
 } // venice
