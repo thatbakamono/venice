@@ -44,7 +44,7 @@ PeFile::ParseStatusCode PeFile::ParseFile() noexcept {
   }
 
   for (int i = 0; i < nt_headers_->FileHeader.NumberOfSections; i++) {
-    auto section_header = reinterpret_cast<PIMAGE_SECTION_HEADER>(image_start_ + dos_header_->e_lfanew + sizeof(_IMAGE_NT_HEADERS64) + i * sizeof(IMAGE_SECTION_HEADER));
+    auto *section_header = reinterpret_cast<PIMAGE_SECTION_HEADER>(image_start_ + dos_header_->e_lfanew + sizeof(_IMAGE_NT_HEADERS64) + i * sizeof(IMAGE_SECTION_HEADER));
 
     section_headers_.push_back(section_header);
   }
@@ -63,7 +63,7 @@ void PeFile::ParseImportTable(PIMAGE_DATA_DIRECTORY data_directory) noexcept {
   const auto iat_rva = nt_headers_->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress;
 
   // Get the Import Descriptors
-  auto imports = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(
+  const auto *imports = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(
     image_start_ + GetFileOffsetFromRVA(data_directory->VirtualAddress)
   );
 
@@ -104,7 +104,7 @@ void PeFile::ParseImportTable(PIMAGE_DATA_DIRECTORY data_directory) noexcept {
           .dll_name = dll_name,
           .function_name = import_by_name->Name,
           .RVA = thunk->u1.AddressOfData,
-          .IAT_RVA = (iat_rva + current_idx)
+          .IAT_RVA = (imports->FirstThunk + current_idx)
         });
       }
 
@@ -119,11 +119,27 @@ void PeFile::ParseImportTable(PIMAGE_DATA_DIRECTORY data_directory) noexcept {
 }
 
 void PeFile::ParseExportTable(PIMAGE_DATA_DIRECTORY data_directory) noexcept {
-  auto exports = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(image_start_ + this->GetFileOffsetFromRVA(data_directory->VirtualAddress));
+  if (!data_directory || data_directory->VirtualAddress == 0) {
+    return;
+  }
 
-  auto address_of_functions = reinterpret_cast<uint32_t *>(image_start_ + this->GetFileOffsetFromRVA(exports->AddressOfFunctions));
-  auto address_of_name_ord = reinterpret_cast<uint16_t *>(image_start_ + this->GetFileOffsetFromRVA(exports->AddressOfNameOrdinals));
-  auto address_of_names = reinterpret_cast<uint32_t *>(image_start_ + this->GetFileOffsetFromRVA(exports->AddressOfNames));
+  const auto exports = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(
+      image_start_ + this->GetFileOffsetFromRVA(data_directory->VirtualAddress));
+
+  if (!exports) {
+    return;
+  }
+
+  const auto address_of_functions = reinterpret_cast<uint32_t *>(
+      image_start_ + this->GetFileOffsetFromRVA(exports->AddressOfFunctions));
+  const auto address_of_name_ord = reinterpret_cast<uint16_t *>(
+      image_start_ + this->GetFileOffsetFromRVA(exports->AddressOfNameOrdinals));
+  const auto address_of_names = reinterpret_cast<uint32_t *>(
+      image_start_ + this->GetFileOffsetFromRVA(exports->AddressOfNames));
+
+  if (!address_of_functions || !address_of_name_ord || !address_of_names) {
+    return;
+  }
 
   for (auto i = 0; i < exports->NumberOfFunctions; i++) {
     if (address_of_functions[i] == 0) {
@@ -131,21 +147,29 @@ void PeFile::ParseExportTable(PIMAGE_DATA_DIRECTORY data_directory) noexcept {
     }
 
     std::string function_name;
+    const uint16_t ordinal = static_cast<uint16_t>(exports->Base + i);
 
+    bool has_name = false;
     for (auto j = 0; j < exports->NumberOfNames; j++) {
       if (address_of_name_ord[j] == i) {
-        function_name = std::string(reinterpret_cast<char *>(image_start_ + this->GetFileOffsetFromRVA(address_of_names[j])));
+        function_name = std::string(reinterpret_cast<char *>(
+            image_start_ + this->GetFileOffsetFromRVA(address_of_names[j])));
+        has_name = true;
         break;
       }
     }
 
-    exports_.push_back(PeExport {
-      function_name,
-      static_cast<uint64_t>(i),
-      address_of_functions[i]
-    });
+    if (!has_name) {
+      function_name = "Ordinal_" + std::to_string(ordinal);
+    }
+
+    exports_.push_back(PeExport{
+        function_name,
+        static_cast<uint64_t>(ordinal),
+        address_of_functions[i]});
   }
 }
+
 
 PIMAGE_DOS_HEADER PeFile::GetDosHeader() const noexcept {
   return dos_header_;
@@ -168,19 +192,21 @@ std::vector<PeImport> PeFile::GetImports() const noexcept {
 }
 
 uint64_t PeFile::GetFileOffsetFromRVA(uint64_t rva) const noexcept {
-  // Iterate through the section headers to find the section that contains the RVA
-  auto section_header = reinterpret_cast<PIMAGE_SECTION_HEADER>(
-      image_start_ + dos_header_->e_lfanew + sizeof(IMAGE_NT_HEADERS)
-  );
+  // Iterate through the section headers to find the section that contains the
+  // RVA
+  const auto section_header = reinterpret_cast<PIMAGE_SECTION_HEADER>(
+      image_start_ + dos_header_->e_lfanew + sizeof(IMAGE_NT_HEADERS));
 
   for (int i = 0; i < nt_headers_->FileHeader.NumberOfSections; ++i) {
     // Check if the RVA falls within this section's virtual address range
     if (rva >= section_header[i].VirtualAddress &&
-        rva < section_header[i].VirtualAddress + section_header[i].SizeOfRawData) {
+        rva < section_header[i].VirtualAddress +
+                  section_header[i].SizeOfRawData) {
       // Calculate the file offset by adding the section's pointer to raw data
       // and the difference between the RVA and the section's virtual address
-      return section_header[i].PointerToRawData + (rva - section_header[i].VirtualAddress);
-        }
+      return section_header[i].PointerToRawData +
+             (rva - section_header[i].VirtualAddress);
+    }
   }
 
   // If the RVA is not found in any section, return 0 (invalid)

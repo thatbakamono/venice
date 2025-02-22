@@ -14,12 +14,12 @@ struct PeExport {
   uint64_t RVA;
 };
 
-// @TODO: Add IAT parsing and save RVA for PE loading libraries
 struct PeImport {
   std::string dll_name;
   std::string function_name;
 
   uint64_t RVA;
+  uint64_t IAT_RVA;
 };
 
 template<typename Callback>
